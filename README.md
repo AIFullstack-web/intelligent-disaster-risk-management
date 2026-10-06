@@ -416,21 +416,9 @@ A dedicated architecture/diagram document can be maintained as `docs/architectur
 **Department of Computer Science and Engineering**  
 **Academic Year: 2026–27**
 
-- KATTARI PRINCY VENEELA
+- KATTARI PRINCY VENEELA 
 - CHANDAN KUMAR SAH TELI
 - CHINTHA SWAPNA
 - ALLAM B V ESWARA SAI
 
 **Guide:** JYOTHULA VIDYA, Asst. Professor
-
----
-
-## License
-
-Choose and add the appropriate project license before public release.
-
----
-
-## Project Principle
-
-> **Build the simplest reliable system that can demonstrate the complete path from disaster-related data to an interpretable, map-based decision-support output.**
