@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 
 from .models import RiskRecord
 from .services.risk import calculate_demo_risk
@@ -8,6 +9,17 @@ app = FastAPI(
     title="Intelligent Disaster Risk Management API",
     version="0.2.0",
     description="Backend API for disaster risk assessment and emergency response support.",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -43,7 +55,7 @@ def get_risk(risk_id: str):
     raise HTTPException(status_code=404, detail="Risk record not found")
 
 
-@app.get("/api/priorities")
+@app.get("/api/priorities", response_model=list[RiskRecord])
 def priorities():
     return sorted(
         RISK_RECORDS,
@@ -54,7 +66,9 @@ def priorities():
 
 @app.get("/api/alerts")
 def alerts():
-    critical = [record for record in RISK_RECORDS if record.risk_level == "CRITICAL"]
+    critical = [
+        record for record in RISK_RECORDS if record.risk_level == "CRITICAL"
+    ]
     high = [record for record in RISK_RECORDS if record.risk_level == "HIGH"]
 
     return [
@@ -68,15 +82,37 @@ def alerts():
             "id": "ALERT-002",
             "severity": "HIGH",
             "title": "Heavy rainfall detected",
-            "message": f"{len(high)} high-risk asset(s) are under elevated rainfall exposure.",
+            "message": (
+                f"{len(high)} high-risk asset(s) are under elevated rainfall "
+                "exposure."
+            ),
         },
         {
             "id": "ALERT-003",
             "severity": "INFO",
             "title": "Inspection queue updated",
-            "message": "Priority rankings were recalculated from the current scenario.",
+            "message": (
+                "Priority rankings were recalculated from the current scenario."
+            ),
         },
     ]
+
+
+@app.get("/api/summary")
+def summary():
+    critical = sum(record.risk_level == "CRITICAL" for record in RISK_RECORDS)
+    high = sum(record.risk_level == "HIGH" for record in RISK_RECORDS)
+    moderate = sum(record.risk_level == "MODERATE" for record in RISK_RECORDS)
+    low = sum(record.risk_level == "LOW" for record in RISK_RECORDS)
+
+    return {
+        "total_assets": len(RISK_RECORDS),
+        "critical": critical,
+        "high": high,
+        "moderate": moderate,
+        "low": low,
+        "open_alerts": len((critical, high)),
+    }
 
 
 @app.post("/api/assessment")
