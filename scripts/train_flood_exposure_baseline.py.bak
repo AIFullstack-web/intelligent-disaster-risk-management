@@ -1,0 +1,471 @@
+from pathlib import Path
+import json
+import warnings
+
+import joblib
+import numpy as np
+import pandas as pd
+import sklearn
+
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.dummy import DummyClassifier
+from sklearn.model_selection import GroupKFold
+from sklearn.metrics import (
+    average_precision_score,
+    roc_auc_score,
+    brier_score_loss,
+)
+
+ROOT = Path(__file__).resolve().parents[1]
+DATA = ROOT / "data" / "processed"
+INPUT = DATA / "bridge_event_ml_features.csv"
+OUT = ROOT / "artifacts" / "flood_exposure_baseline"
+
+TARGET = "flood_exposed"
+GROUP = "event_id"
+DATE = "StartDate"
+
+RAIN_FEATURES = [
+    "rain_sum_3d_pre_event_mm",
+    "rain_sum_7d_pre_event_mm",
+    "rain_sum_14d_pre_event_mm",
+    "rain_max_3d_pre_event_mm",
+    "rain_max_7d_pre_event_mm",
+    "rain_max_14d_pre_event_mm",
+    "rain_mean_7d_pre_event_mm",
+    "rain_mean_14d_pre_event_mm",
+]
+
+STATIC_NUMERIC = [
+    "latitude",
+    "longitude",
+    "length_m",
+    "lanes",
+]
+
+STATIC_CATEGORICAL = [
+    "highway",
+    "surface",
+]
+
+STATIC_FEATURES = STATIC_NUMERIC + STATIC_CATEGORICAL
+FULL_FEATURES = STATIC_FEATURES + RAIN_FEATURES
+
+MODEL_SPECS = {
+    "prior_baseline": {
+        "kind": "dummy",
+        "features": FULL_FEATURES,
+    },
+    "static_logistic": {
+        "kind": "logistic",
+        "features": STATIC_FEATURES,
+    },
+    "full_logistic": {
+        "kind": "logistic",
+        "features": FULL_FEATURES,
+    },
+    "full_random_forest": {
+        "kind": "forest",
+        "features": FULL_FEATURES,
+    },
+}
+
+OUTPUT_FILES = [
+    "selected_model.joblib",
+    "cv_event_metrics.csv",
+    "cv_model_summary.csv",
+    "test_metrics.json",
+    "test_event_metrics.csv",
+    "test_predictions.csv",
+    "feature_importance.csv",
+    "run_metadata.json",
+]
+
+
+def stop(message):
+    raise ValueError(message)
+
+
+def make_preprocessor(features, scale_numeric):
+    numeric = [c for c in features if c in STATIC_NUMERIC + RAIN_FEATURES]
+    categorical = [c for c in features if c in STATIC_CATEGORICAL]
+
+    numeric_steps = [
+        ("imputer", SimpleImputer(strategy="median"))
+    ]
+    if scale_numeric:
+        numeric_steps.append(("scaler", StandardScaler()))
+
+    numeric_pipe = Pipeline(numeric_steps)
+
+    categorical_pipe = Pipeline([
+        ("imputer", SimpleImputer(
+            strategy="constant",
+            fill_value="__MISSING__"
+        )),
+        ("encoder", OneHotEncoder(handle_unknown="ignore")),
+    ])
+
+    transformers = [
+        ("numeric", numeric_pipe, numeric),
+        ("categorical", categorical_pipe, categorical),
+    ]
+
+    return ColumnTransformer(transformers, remainder="drop")
+
+
+def make_model(name):
+    spec = MODEL_SPECS[name]
+    kind = spec["kind"]
+
+    if kind == "dummy":
+        return DummyClassifier(strategy="prior")
+
+    if kind == "logistic":
+        preprocessor = make_preprocessor(
+            spec["features"], scale_numeric=True
+        )
+        classifier = LogisticRegression(
+            max_iter=500,
+            class_weight="balanced",
+            solver="liblinear",
+            random_state=42,
+        )
+    else:
+        preprocessor = make_preprocessor(
+            spec["features"], scale_numeric=False
+        )
+        classifier = RandomForestClassifier(
+            n_estimators=100,
+            max_depth=18,
+            min_samples_leaf=15,
+            max_features="sqrt",
+            class_weight="balanced_subsample",
+            n_jobs=-1,
+            random_state=42,
+        )
+
+    return Pipeline([
+        ("preprocess", preprocessor),
+        ("classifier", classifier),
+    ])
+
+
+def score_predictions(y_true, probabilities):
+    y = np.asarray(y_true, dtype=int)
+    p = np.asarray(probabilities, dtype=float)
+
+    if len(np.unique(y)) != 2:
+        roc_auc = None
+    else:
+        roc_auc = float(roc_auc_score(y, p))
+
+    top_count = max(1, int(np.ceil(0.10 * len(y))))
+    top_indices = np.argsort(-p, kind="stable")[:top_count]
+    positives = int(y.sum())
+    top_positives = int(y[top_indices].sum())
+
+    return {
+        "rows": int(len(y)),
+        "positives": positives,
+        "exposure_rate": float(y.mean()),
+        "average_precision": float(average_precision_score(y, p)),
+        "roc_auc": roc_auc,
+        "brier_score": float(brier_score_loss(y, p)),
+        "precision_at_top_10pct": float(y[top_indices].mean()),
+        "recall_at_top_10pct": (
+            float(top_positives / positives) if positives else None
+        ),
+    }
+
+
+def main():
+    if not INPUT.exists():
+        stop(f"Feature dataset not found: {INPUT}")
+
+    existing = [name for name in OUTPUT_FILES if (OUT / name).exists()]
+    if existing:
+        stop(
+            "Refusing to overwrite existing results in "
+            f"{OUT}: {existing}"
+        )
+
+    df = pd.read_csv(INPUT, low_memory=False)
+
+    required = set(
+        ["asset_id", "event_id", "StartDate", "EndDate", TARGET]
+        + FULL_FEATURES
+    )
+    missing_columns = required - set(df.columns)
+    if missing_columns:
+        stop(f"Missing required columns: {sorted(missing_columns)}")
+
+    if df.duplicated(["asset_id", "event_id"]).any():
+        stop("Duplicate bridge-event rows found.")
+
+    df["StartDate"] = pd.to_datetime(df["StartDate"], errors="raise")
+    df["year"] = df["StartDate"].dt.year
+
+    if set(df["year"].unique()) != {2014, 2015}:
+        stop("Expected exactly the 2014 training and 2015 test years.")
+
+    if df[FULL_FEATURES].isna().any().any():
+        stop("Missing predictors found; investigate before training.")
+
+    feature_matrix = df[FULL_FEATURES].apply(
+        pd.to_numeric,
+        errors="ignore"
+    )
+
+    for col in RAIN_FEATURES + STATIC_NUMERIC:
+        feature_matrix[col] = pd.to_numeric(
+            feature_matrix[col], errors="coerce"
+        )
+        if not np.isfinite(feature_matrix[col].dropna()).all():
+            stop(f"Non-finite values found in predictor: {col}")
+
+    y_all = pd.to_numeric(df[TARGET], errors="raise").astype(int)
+    if not set(y_all.unique()).issubset({0, 1}):
+        stop("Target must contain only 0 and 1.")
+
+    train_mask = df["year"].eq(2014)
+    test_mask = df["year"].eq(2015)
+
+    train = df.loc[train_mask].copy().reset_index(drop=True)
+    test = df.loc[test_mask].copy().reset_index(drop=True)
+    X_train = feature_matrix.loc[train_mask].reset_index(drop=True)
+    X_test = feature_matrix.loc[test_mask].reset_index(drop=True)
+    y_train = y_all.loc[train_mask].reset_index(drop=True)
+    y_test = y_all.loc[test_mask].reset_index(drop=True)
+
+    train_events = set(train[GROUP].unique())
+    test_events = set(test[GROUP].unique())
+
+    if train_events & test_events:
+        stop("Event overlap detected between training and final test.")
+
+    if train[GROUP].nunique() != 5 or test[GROUP].nunique() != 3:
+        stop("Unexpected event counts; expected 5 training and 3 test events.")
+
+    if y_train.nunique() < 2 or y_test.nunique() < 2:
+        stop("Training and test partitions must each contain both classes.")
+
+    print("SCIKIT_LEARN_VERSION:", sklearn.__version__)
+    print("TRAIN_ROWS:", len(train))
+    print("TRAIN_EVENTS:", len(train_events))
+    print("TRAIN_EXPOSURE_RATE_PCT:", round(100 * y_train.mean(), 2))
+    print("TEST_ROWS:", len(test))
+    print("TEST_EVENTS:", len(test_events))
+    print("TEST_EXPOSURE_RATE_PCT:", round(100 * y_test.mean(), 2))
+    print("EVENT_OVERLAP:", len(train_events & test_events))
+    print("VALIDATION: 5-fold GroupKFold by 2014 event")
+    print("MODEL_SELECTION: mean event-level average precision")
+
+    cv = GroupKFold(n_splits=train[GROUP].nunique())
+    cv_rows = []
+
+    for model_name, spec in MODEL_SPECS.items():
+        cols = spec["features"]
+
+        for fold, (fit_idx, val_idx) in enumerate(
+            cv.split(X_train[cols], y_train, groups=train[GROUP]),
+            start=1,
+        ):
+            fit_x = X_train.iloc[fit_idx][cols]
+            val_x = X_train.iloc[val_idx][cols]
+            fit_y = y_train.iloc[fit_idx]
+            val_y = y_train.iloc[val_idx]
+            held_events = sorted(train.iloc[val_idx][GROUP].unique())
+
+            model = make_model(model_name)
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("default")
+                model.fit(fit_x, fit_y)
+
+            probabilities = model.predict_proba(val_x)[:, 1]
+            metrics = score_predictions(val_y, probabilities)
+
+            cv_rows.append({
+                "model": model_name,
+                "fold": fold,
+                "held_out_events": ";".join(held_events),
+                **metrics,
+            })
+
+            print(
+                f"CV model={model_name} fold={fold} "
+                f"event={';'.join(held_events)} "
+                f"AP={metrics['average_precision']:.4f}"
+            )
+
+    cv_df = pd.DataFrame(cv_rows)
+
+    priority = {
+        "prior_baseline": 0,
+        "static_logistic": 1,
+        "full_logistic": 2,
+        "full_random_forest": 3,
+    }
+
+    summary = cv_df.groupby("model").agg(
+        mean_average_precision=("average_precision", "mean"),
+        std_average_precision=("average_precision", "std"),
+        mean_roc_auc=("roc_auc", "mean"),
+        mean_brier_score=("brier_score", "mean"),
+        mean_precision_at_top_10pct=("precision_at_top_10pct", "mean"),
+        mean_recall_at_top_10pct=("recall_at_top_10pct", "mean"),
+    ).reset_index()
+
+    summary["complexity_tiebreak"] = summary["model"].map(priority)
+    summary = summary.sort_values(
+        ["mean_average_precision", "complexity_tiebreak"],
+        ascending=[False, True],
+    ).reset_index(drop=True)
+
+    selected_name = summary.iloc[0]["model"]
+    selected_features = MODEL_SPECS[selected_name]["features"]
+
+    print("\nMODEL SELECTION SUMMARY:")
+    print(summary.drop(columns="complexity_tiebreak").to_string(index=False))
+    print("\nSELECTED_MODEL:", selected_name)
+
+    selected_model = make_model(selected_name)
+    selected_model.fit(
+        X_train[selected_features],
+        y_train,
+    )
+
+    test_probabilities = selected_model.predict_proba(
+        X_test[selected_features]
+    )[:, 1]
+
+    overall_metrics = score_predictions(y_test, test_probabilities)
+    overall_metrics["selected_model"] = selected_name
+    overall_metrics["test_year"] = 2015
+    overall_metrics["training_year"] = 2014
+    overall_metrics["test_events"] = sorted(test_events)
+
+    predictions = test[
+        ["asset_id", "osm_id", "event_id", "StartDate", "EndDate", TARGET]
+    ].copy()
+    predictions["predicted_exposure_probability"] = test_probabilities
+    predictions["priority_rank_within_event"] = (
+        predictions.groupby(GROUP)["predicted_exposure_probability"]
+        .rank(method="first", ascending=False)
+        .astype(int)
+    )
+    per_event_top_count = predictions.groupby(GROUP)[GROUP].transform(
+        "size"
+    ).mul(0.10).apply(np.ceil).astype(int)
+
+    predictions["top_10pct_priority"] = (
+        predictions["priority_rank_within_event"] <= per_event_top_count
+    )
+
+    event_metrics = []
+    for event_id, indices in test.groupby(GROUP).groups.items():
+        metrics = score_predictions(
+            y_test.iloc[list(indices)],
+            test_probabilities[list(indices)],
+        )
+        event_metrics.append({"event_id": event_id, **metrics})
+
+    importance_df = pd.DataFrame(columns=[
+        "feature", "importance", "signed_coefficient"
+    ])
+
+    if hasattr(selected_model, "named_steps"):
+        try:
+            preprocess = selected_model.named_steps["preprocess"]
+            estimator = selected_model.named_steps["classifier"]
+            names = preprocess.get_feature_names_out()
+
+            if hasattr(estimator, "feature_importances_"):
+                values = estimator.feature_importances_
+                importance_df = pd.DataFrame({
+                    "feature": names,
+                    "importance": values,
+                    "signed_coefficient": np.nan,
+                })
+            elif hasattr(estimator, "coef_"):
+                coefficients = estimator.coef_[0]
+                importance_df = pd.DataFrame({
+                    "feature": names,
+                    "importance": np.abs(coefficients),
+                    "signed_coefficient": coefficients,
+                })
+
+            if not importance_df.empty:
+                importance_df = importance_df.sort_values(
+                    "importance", ascending=False
+                )
+        except Exception as exc:
+            print("FEATURE_IMPORTANCE_NOTE:", str(exc))
+
+    OUT.mkdir(parents=True, exist_ok=True)
+
+    cv_df.to_csv(OUT / "cv_event_metrics.csv", index=False)
+    summary.drop(columns="complexity_tiebreak").to_csv(
+        OUT / "cv_model_summary.csv", index=False
+    )
+    pd.DataFrame(event_metrics).to_csv(
+        OUT / "test_event_metrics.csv", index=False
+    )
+    predictions.to_csv(OUT / "test_predictions.csv", index=False)
+    importance_df.to_csv(OUT / "feature_importance.csv", index=False)
+
+    with open(OUT / "test_metrics.json", "w", encoding="utf-8") as file:
+        json.dump(overall_metrics, file, indent=2)
+
+    metadata = {
+        "selected_model": selected_name,
+        "target": "Historical flood-polygon exposure, not structural damage",
+        "training_year": 2014,
+        "test_year": 2015,
+        "training_rows": int(len(train)),
+        "test_rows": int(len(test)),
+        "training_events": sorted(train_events),
+        "test_events": sorted(test_events),
+        "selection_method": (
+            "Highest mean average precision across five GroupKFold "
+            "validation folds grouped by 2014 event"
+        ),
+        "predictor_columns": selected_features,
+        "excluded_from_predictors": [
+            "asset_id", "osm_id", "event_id", "StartDate", "EndDate",
+            "flood_exposed", "name", "ref", "State", "MainCause",
+            "rainfall mapping and proxy quality flags",
+        ],
+        "limitations": [
+            "Only five training events and three held-out test events.",
+            "All bridge locations occur in both years; this is not an unseen-bridge test.",
+            "The two adjacent August 2015 events share the same exposed bridges.",
+            "321 bridges use a nearest-valid-grid proxy; their mapping distances are documented separately.",
+            "Exposure labels indicate intersection with historical flood polygons, not observed damage or structural failure.",
+        ],
+        "scikit_learn_version": sklearn.__version__,
+    }
+
+    joblib.dump(selected_model, OUT / "selected_model.joblib")
+
+    with open(OUT / "run_metadata.json", "w", encoding="utf-8") as file:
+        json.dump(metadata, file, indent=2)
+
+    print("\nFINAL 2015 TEST METRICS:")
+    print(json.dumps(overall_metrics, indent=2))
+    print("\nPER-EVENT TEST METRICS:")
+    print(pd.DataFrame(event_metrics).to_string(index=False))
+    print("\nARTIFACT_DIRECTORY:", OUT)
+    print("CV_RESULTS_SAVED: PASSED")
+    print("FINAL_TEST_EVALUATED_ONCE: PASSED")
+    print("MODEL_AND_METADATA_SAVED: PASSED")
+
+
+if __name__ == "__main__":
+    main()
