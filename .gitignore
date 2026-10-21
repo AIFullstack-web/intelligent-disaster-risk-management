@@ -1,21 +1,34 @@
-# Python
+# Virtual Environment
 .venv/
+venv/
+ENV/
+env/
+
+# Node & Frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+.eslintcache
+
+# Python & Pytest
 __pycache__/
 *.py[cod]
+*$py.class
 .pytest_cache/
-.mypy_cache/
+.coverage
+htmlcov/
 
-# Node
-node_modules/
-frontend/dist/
-frontend/.vite/
+# Raw Data (Prevent committing large rasters/datasets)
+data/raw/*
+!data/raw/.gitkeep
 
-# Environment files
+# Environment & Credentials
 .env
-.env.*
-!.env.example
+*.env.local
+*.pem
 
-# IDE / OS
+# IDEs & OS
 .vscode/
 .idea/
 .DS_Store
